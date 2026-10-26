@@ -1,5 +1,22 @@
 import { useEffect, useMemo, useState } from "react";
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  onAuthStateChanged,
+  updateProfile,
+  signOut,
+} from "firebase/auth";
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  updateDoc,
+  onSnapshot,
+} from "firebase/firestore";
+import { auth, db } from "./firebase";
 import "./App.css";
+
 
 const initialTasks = [
   {
@@ -28,14 +45,9 @@ const navItems = [
 ];
 
 function App() {
-  const [tasks, setTasks] = useState(() => {
-    try {
-      const saved = localStorage.getItem("taskmaster-tasks");
-      return saved ? JSON.parse(saved) : initialTasks;
-    } catch {
-      return initialTasks;
-    }
-  });
+ const [tasks, setTasks] = useState([]);
+const [tasksLoading, setTasksLoading] = useState(true);
+const [taskError, setTaskError] = useState("");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [priority, setPriority] = useState("Medium");
@@ -44,7 +56,65 @@ function App() {
   const [filter, setFilter] = useState("All");
   const [editingId, setEditingId] = useState(null);
   const [page, setPage] = useState("Dashboard");
-  const [user, setUser] = useState(() => localStorage.getItem("taskmaster-user") || "");
+  const [user, setUser] = useState(null);
+const [authLoading, setAuthLoading] = useState(true);
+
+useEffect(() => {
+  const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+    setUser(
+      currentUser
+        ? {
+            uid: currentUser.uid,
+            name:
+              currentUser.displayName ||
+              currentUser.email?.split("@")[0],
+            email: currentUser.email,
+          }
+        : null
+    );
+
+    setAuthLoading(false);
+  });
+
+  return unsubscribe;
+}, []);
+
+useEffect(() => {
+  if (!user?.uid) {
+    setTasks([]);
+    setTasksLoading(false);
+    return;
+  }
+
+  setTasksLoading(true);
+  setTaskError("");
+
+  const tasksRef = collection(db, "users", user.uid, "tasks");
+
+  const unsubscribe = onSnapshot(
+    tasksRef,
+    (snapshot) => {
+      const userTasks = snapshot.docs.map((taskDoc) => ({
+        ...taskDoc.data(),
+        id: taskDoc.id,
+      }));
+
+      setTasks(userTasks);
+      setTasksLoading(false);
+    },
+    (error) => {
+      console.error("Firestore loading error:", error);
+      setTaskError(
+        "Tasks load nahi hue. Firestore rules check karo."
+      );
+      setTasksLoading(false);
+    }
+  );
+
+  return unsubscribe;
+}, [user?.uid]);
+
+
   const [authMode, setAuthMode] = useState("Login");
   const [authName, setAuthName] = useState("");
   const [authEmail, setAuthEmail] = useState("");
@@ -53,9 +123,7 @@ function App() {
   const [calendarMonth, setCalendarMonth] = useState(new Date());
   const [selectedDate, setSelectedDate] = useState(new Date().getDate());
 
-  useEffect(() => {
-    localStorage.setItem("taskmaster-tasks", JSON.stringify(tasks));
-  }, [tasks]);
+  
 
   const completedCount = tasks.filter((task) => task.completed).length;
   const pendingCount = tasks.length - completedCount;
@@ -88,18 +156,59 @@ function App() {
     setEditingId(null);
   }
 
-  function saveTask(event) {
-    event.preventDefault();
-    if (!title.trim()) return;
-    const taskData = { title: title.trim(), description: description.trim(), priority, dueDate };
+  
+async function saveTask(event) {
+  event.preventDefault();
+
+  if (!title.trim()) {
+    setTaskError("Task title enter karo.");
+    return;
+  }
+
+  if (!user?.uid) {
+    setTaskError("Task save karne ke liye login karo.");
+    return;
+  }
+
+  setTaskError("");
+
+  const taskData = {
+    title: title.trim(),
+    description: description.trim(),
+    priority,
+    dueDate,
+  };
+
+  try {
+    const tasksRef = collection(db, "users", user.uid, "tasks");
+
     if (editingId !== null) {
-      setTasks((previous) => previous.map((task) => task.id === editingId ? { ...task, ...taskData } : task));
+      const taskRef = doc(
+        db,
+        "users",
+        user.uid,
+        "tasks",
+        String(editingId)
+      );
+
+      await updateDoc(taskRef, taskData);
     } else {
-      setTasks((previous) => [{ id: Date.now(), ...taskData, completed: false }, ...previous]);
+      await addDoc(tasksRef, {
+        ...taskData,
+        completed: false,
+        createdAt: Date.now(),
+      });
     }
+
     resetForm();
     setPage("All Tasks");
+  } catch (error) {
+    console.error("Task save error:", error);
+    setTaskError(
+      "Task save nahi hua. Internet aur Firestore rules check karo."
+    );
   }
+}
 
   function editTask(task) {
     setTitle(task.title || "");
@@ -111,36 +220,138 @@ function App() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  function deleteTask(id) {
-    if (!window.confirm("Are you sure you want to delete this task?")) return;
-    setTasks((previous) => previous.filter((task) => task.id !== id));
-    if (editingId === id) resetForm();
+  
+async function deleteTask(id) {
+  if (!window.confirm("Are you sure you want to delete this task?")) {
+    return;
   }
 
-  function toggleTask(id) {
-    setTasks((previous) => previous.map((task) => task.id === id ? { ...task, completed: !task.completed } : task));
+  if (!user?.uid) {
+    setTaskError("Task delete karne ke liye login karo.");
+    return;
   }
 
-  function handleAuth(event) {
-    event.preventDefault();
-    setAuthError("");
-    if (!authEmail.trim() || !authPassword.trim()) {
-      setAuthError("Please enter your email and password.");
-      return;
+  setTaskError("");
+
+  try {
+    const taskRef = doc(
+      db,
+      "users",
+      user.uid,
+      "tasks",
+      String(id)
+    );
+
+    await deleteDoc(taskRef);
+
+    if (String(editingId) === String(id)) {
+      resetForm();
     }
-    if (authMode === "Signup" && !authName.trim()) {
-      setAuthError("Please enter your name.");
-      return;
+  } catch (error) {
+    console.error("Task delete error:", error);
+    setTaskError("Task delete nahi hua. Firebase console check karo.");
+  }
+}
+
+async function toggleTask(id) {
+  if (!user?.uid) {
+    setTaskError("Pehle login karo.");
+    return;
+  }
+
+  const task = tasks.find(
+    (item) => String(item.id) === String(id)
+  );
+
+  if (!task) {
+    setTaskError("Task nahi mila. Page refresh karke try karo.");
+    return;
+  }
+
+  setTaskError("");
+
+  try {
+    const taskRef = doc(
+      db,
+      "users",
+      user.uid,
+      "tasks",
+      String(task.id)
+    );
+
+    await updateDoc(taskRef, {
+      completed: !task.completed,
+    });
+  } catch (error) {
+    console.error("Toggle task error:", error);
+    setTaskError("Task update nahi hua. Firebase document check karo.");
+  }
+}
+
+
+
+
+async function handleAuth(event) {
+  event.preventDefault();
+
+  setAuthError("");
+
+
+  if (!authEmail.trim() || !authPassword) {
+    setAuthError("Please enter your email and password.");
+    return;
+  }
+
+  if (authMode === "Signup" && !authName.trim()) {
+    setAuthError("Please enter your name.");
+    return;
+  }
+
+  try {
+    if (authMode === "Signup") {
+      const credential = await createUserWithEmailAndPassword(
+        auth,
+        authEmail.trim(),
+        authPassword
+      );
+
+      await updateProfile(credential.user, {
+        displayName: authName.trim(),
+      });
+
+      setUser({
+        uid: credential.user.uid,
+        name: authName.trim(),
+        email: credential.user.email,
+      });
+    } else {
+      await signInWithEmailAndPassword(
+        auth,
+        authEmail.trim(),
+        authPassword
+      );
     }
-    const displayName = authMode === "Signup" ? authName.trim() : authEmail.split("@")[0];
-    localStorage.setItem("taskmaster-user", displayName);
-    setUser(displayName);
+
     setAuthPassword("");
-  }
+  } catch (error) {
+    const messages = {
+      "auth/email-already-in-use": "This email is already registered. Please log in.",
+      "auth/invalid-email": "Please enter a valid email address.",
+      "auth/weak-password": "Password must contain at least 6 characters.",
+      "auth/invalid-credential": "Incorrect email or password.",
+      "auth/too-many-requests": "Too many attempts. Please try again later.",
+      "auth/network-request-failed": "Network error. Check your internet connection.",
+    };
 
-  function logout() {
-    localStorage.removeItem("taskmaster-user");
-    setUser("");
+    setAuthError(
+      messages[error.code] || error.message || "Authentication failed."
+    );
+  }
+}
+
+async function logout() {
+  try {
+    await signOut(auth);
     setAuthEmail("");
     setAuthPassword("");
     setAuthName("");
@@ -148,7 +359,10 @@ function App() {
     setAuthError("");
     setPage("Dashboard");
     resetForm();
+  } catch {
+    setAuthError("Unable to log out. Please try again.");
   }
+}
 
   function changeMonth(offset) {
     setCalendarMonth((current) => new Date(current.getFullYear(), current.getMonth() + offset, 1));
@@ -158,7 +372,9 @@ function App() {
   const firstDay = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), 1).getDay();
   const daysInMonth = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + 1, 0).getDate();
   const calendarCells = [...Array(firstDay).fill(null), ...Array.from({ length: daysInMonth }, (_, i) => i + 1)];
-
+if (authLoading) {
+  return <div className="auth-page">Checking login...</div>;
+}
   if (!user) {
     return (
       <div className="auth-page">
@@ -175,7 +391,7 @@ function App() {
           </div>
           {authMode === "Signup" && <label>Full name<input value={authName} onChange={(e) => setAuthName(e.target.value)} placeholder="Your name" required /></label>}
           <label>Email address<input type="email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="you@example.com" required /></label>
-          <label>Password<input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="Enter demo password" required /></label>
+          <label>Password<input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="Enter your password" required /></label>
           {authError && <p className="error-message">{authError}</p>}
           <button type="submit" className="primary-button auth-submit">{authMode === "Login" ? "Enter Dashboard ↗" : "Create Workspace ↗"}</button>
           <p className="demo-note">Demo login only — this is not secure authentication.</p>
@@ -204,23 +420,28 @@ function App() {
           <div className="mini-progress"><span style={{ width: `${progress}%` }} /></div>
         </div>
         <div className="sidebar-user">
-          <div className="avatar">{user.charAt(0).toUpperCase()}</div>
-          <div className="user-info"><strong>{user}</strong><span>Personal workspace</span></div>
+          <div className="avatar">{(user?.name || user?.email || "U").charAt(0).toUpperCase()}</div>
+          <div className="user-info"><strong>{user.name}</strong><span>Personal workspace</span></div>
           <button className="logout-button" onClick={logout} title="Log out" type="button">↗</button>
         </div>
       </aside>
-
+            
       <main className="main-content">
         <header className="topbar">
           <div className="mobile-brand">TM<span>✦</span> TaskMaster</div>
           <div className="weather-chip"><span className="weather-icon">☀</span><div><strong>YOUR WORKSPACE</strong><small>One task at a time</small></div></div>
           <label className="global-search"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search your missions..." aria-label="Search tasks" /><kbd>⌘ K</kbd></label>
-          <div className="topbar-actions"><span className="status-pill"><i /> SYSTEM ONLINE</span><button className="icon-button" type="button" title="Notifications">♧</button><div className="avatar top-avatar">{user.charAt(0).toUpperCase()}</div></div>
+          <div className="topbar-actions"><span className="status-pill"><i /> SYSTEM ONLINE</span><button className="icon-button" type="button" title="Notifications">♧</button><div className="avatar top-avatar">{user.name.charAt(0).toUpperCase()}</div></div>
         </header>
-
+          
         <div className="content-wrap">
+          {taskError && (
+  <p className="error-message" role="alert">
+    {taskError}
+  </p>
+)}
           <div className="page-heading">
-            <div><p className="eyebrow">YOUR PERSONAL COMMAND CENTER</p><h1>{page === "Dashboard" ? "Dashboard" : page}</h1><p className="heading-subtitle">Welcome back, {user}. Ready for your next mission?</p></div>
+            <div><p className="eyebrow">YOUR PERSONAL COMMAND CENTER</p><h1>{page === "Dashboard" ? "Dashboard" : page}</h1><p className="heading-subtitle">Welcome back, {user.name}. Ready for your next mission?</p></div>
             <div className="heading-actions"><span className="date-chip">◷ {new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}</span><button className="primary-button" onClick={() => { setPage("All Tasks"); resetForm(); document.querySelector(".task-form-card")?.scrollIntoView({ behavior: "smooth", block: "start" }); }} type="button">＋ New Task</button></div>
           </div>
 
@@ -287,12 +508,33 @@ function App() {
 
                 <div className="panel recent-panel">
                   <div className="panel-heading"><div><p className="eyebrow">RECENT ACTIVITY</p><h2>Latest missions</h2></div><button className="text-button" type="button" onClick={() => setPage("All Tasks")}>View all ↗</button></div>
-                  {tasks.slice(0, 3).length ? tasks.slice(0, 3).map((task) => <div className="recent-item" key={task.id}><span className={`recent-icon ${task.completed ? "recent-done" : ""}`}>{task.completed ? "✓" : "⚡"}</span><div className="recent-copy"><strong>{task.title}</strong><span>{task.dueDate ? `Due ${task.dueDate}` : `${task.priority} priority`}</span></div><span className={`status-badge ${task.completed ? "status-completed" : task.priority === "High" ? "status-high" : "status-pending"}`}>{task.completed ? "Done" : "Active"}</span></div>) : <p className="muted-note">No missions yet. Add your first task.</p>}
+                  {tasks.slice(0, 3).length ? (
+                    tasks.slice(0, 3).map((task) => (
+                      <div className="recent-item" key={task.id}>
+                        <input
+  type="checkbox"
+  className="task-checkbox"
+  checked={Boolean(task.completed)}
+  onChange={() => toggleTask(task.id)}
+  aria-label={`Mark ${task.title} as completed`}
+/>
+                        <span className={`recent-icon ${task.completed ? "recent-done" : ""}`}>{task.completed ? "✓" : "⚡"}</span>
+                        <div className="recent-copy">
+                          <strong>{task.title}</strong>
+                          <span>{task.dueDate ? `Due ${task.dueDate}` : `${task.priority} priority`}</span>
+                        </div>
+                        <span className={`status-badge ${task.completed ? "status-completed" : task.priority === "High" ? "status-high" : "status-pending"}`}>
+                          {task.completed ? "Done" : "Active"}
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="muted-note">No missions yet. Add your first task.</p>
+                  )}
                 </div>
               </section>
             </>
           )}
-
           <section className="panel task-form-card">
             <div className="panel-heading"><div><p className="eyebrow">{editingId !== null ? "UPDATE YOUR MISSION" : "MISSION CONTROL"}</p><h2>{editingId !== null ? "Edit task" : "Create a new task"}</h2></div><span className="panel-tag">✦ TASK MANAGER</span></div>
             <form className="task-form" onSubmit={saveTask}>
